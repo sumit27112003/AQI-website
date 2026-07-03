@@ -167,56 +167,85 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# --- AQI Color & Health Info ---
-def get_aqi_info(aqi_value):
-    if aqi_value <= 50:
-        return {
-            'category': 'Good',
-            'color': '#00E400',
-            'icon': '😊',
-            'health': 'Air quality is satisfactory, and air pollution poses little or no risk.',
-            'recommendation': 'Enjoy outdoor activities!'
-        }
-    elif aqi_value <= 100:
-        return {
-            'category': 'Moderate',
-            'color': '#FFFF00',
-            'icon': '😐',
-            'health': 'Air quality is acceptable. However, there may be a risk for some people.',
-            'recommendation': 'Unusually sensitive people should consider reducing prolonged outdoor exertion.'
-        }
-    elif aqi_value <= 150:
-        return {
-            'category': 'Unhealthy for Sensitive Groups',
-            'color': '#FF7E00',
-            'icon': '😷',
-            'health': 'Members of sensitive groups may experience health effects.',
-            'recommendation': 'Sensitive groups should reduce outdoor activities.'
-        }
-    elif aqi_value <= 200:
-        return {
-            'category': 'Unhealthy',
-            'color': '#FF0000',
-            'icon': '😨',
-            'health': 'Some members of the general public may experience health effects.',
-            'recommendation': 'Everyone should reduce prolonged outdoor exertion.'
-        }
-    elif aqi_value <= 300:
-        return {
-            'category': 'Very Unhealthy',
-            'color': '#8B0000',
-            'icon': '🤢',
-            'health': 'Health alert: The risk of health effects is increased for everyone.',
-            'recommendation': 'Everyone should avoid prolonged outdoor exertion.'
-        }
-    else:
-        return {
-            'category': 'Hazardous',
-            'color': '#4B0000',
-            'icon': '☠️',
-            'health': 'Health warning of emergency conditions: everyone is more likely to be affected.',
-            'recommendation': 'Everyone should avoid all outdoor exertion.'
-        }
+# --- AQI Color & Health Info (CPCB / Indian National AQI scale) ---
+# NOTE: This app is trained on CPCB station data, whose AQI_Bucket labels are
+# Good / Satisfactory / Moderate / Poor / Very Poor / Severe (NOT the US EPA
+# scale). Keys here match le.classes_ exactly so the model's predicted label
+# can be looked up directly - no separate/duplicate categorization logic.
+AQI_CATEGORY_INFO = {
+    'Good': {
+        'range': (0, 50),
+        'color': '#00E400',
+        'icon': '😊',
+        'health': 'Minimal impact. Air quality poses little or no risk.',
+        'recommendation': 'Great day to enjoy outdoor activities!'
+    },
+    'Satisfactory': {
+        'range': (51, 100),
+        'color': '#A3C853',
+        'icon': '🙂',
+        'health': 'Minor breathing discomfort may occur for sensitive people.',
+        'recommendation': 'Outdoor activity is generally fine for most people.'
+    },
+    'Moderate': {
+        'range': (101, 200),
+        'color': '#FFFF00',
+        'icon': '😐',
+        'health': 'Breathing discomfort possible for people with lung disease, asthma, children, and older adults.',
+        'recommendation': 'Sensitive groups should limit prolonged outdoor exertion.'
+    },
+    'Poor': {
+        'range': (201, 300),
+        'color': '#FF7E00',
+        'icon': '😷',
+        'health': 'Breathing discomfort on prolonged exposure for most people.',
+        'recommendation': 'Reduce prolonged or heavy outdoor exertion, especially sensitive groups.'
+    },
+    'Very Poor': {
+        'range': (301, 400),
+        'color': '#FF0000',
+        'icon': '😨',
+        'health': 'Respiratory illness risk on prolonged exposure.',
+        'recommendation': 'Avoid outdoor exertion; sensitive groups should stay indoors.'
+    },
+    'Severe': {
+        'range': (401, 500),
+        'color': '#8B0000',
+        'icon': '☠️',
+        'health': 'Serious risk, affecting even healthy people, with more serious effects on those with existing disease.',
+        'recommendation': 'Everyone should avoid outdoor exertion and stay indoors.'
+    },
+}
+
+
+def get_aqi_info(category_label):
+    """Look up display info for a category label returned by the model.
+    Falls back gracefully if the model ever returns an unseen label."""
+    return AQI_CATEGORY_INFO.get(category_label, {
+        'range': (None, None),
+        'color': '#808080',
+        'icon': '❓',
+        'health': 'Unrecognized category returned by the model.',
+        'recommendation': 'Please check the model / label encoder.'
+    })
+
+
+def pm25_subindex(pm25_value):
+    """CPCB PM2.5 sub-index (0-500), for display as an auxiliary indicative
+    number alongside the model's categorical prediction. This is NOT the
+    model's output - it's a single-pollutant estimate shown for context."""
+    breakpoints = [
+        (0, 30, 0, 50),
+        (31, 60, 51, 100),
+        (61, 90, 101, 200),
+        (91, 120, 201, 300),
+        (121, 250, 301, 400),
+        (251, 500, 401, 500),
+    ]
+    for bp_lo, bp_hi, aqi_lo, aqi_hi in breakpoints:
+        if bp_lo <= pm25_value <= bp_hi:
+            return round(((aqi_hi - aqi_lo) / (bp_hi - bp_lo)) * (pm25_value - bp_lo) + aqi_lo)
+    return 500
 
 # --- Load Model & Helpers ---
 @st.cache_resource
@@ -226,11 +255,27 @@ def load_artifacts():
         model = joblib.load(os.path.join(base_dir, 'models/aqi_decision_tree.pkl'))
         le = joblib.load(os.path.join(base_dir, 'models/label_encoder.pkl'))
         medians = joblib.load(os.path.join(base_dir, 'models/medians.pkl'))
-        return model, le, medians
-    except:
-        return None, None, None
 
-model, le, medians = load_artifacts()
+        # Feature order the model was actually fit with. Prefer the explicit
+        # feature_order.pkl saved by train_model.py (if present); otherwise
+        # fall back to sklearn's auto-stored feature_names_in_, which is set
+        # automatically whenever .fit() is called with a DataFrame - as is
+        # already the case for the current model. Either way this avoids a
+        # hand-typed column list that could silently drift out of sync with
+        # train_model.py.
+        feature_order_path = os.path.join(base_dir, 'models/feature_order.pkl')
+        if os.path.exists(feature_order_path):
+            feature_order = joblib.load(feature_order_path)
+        else:
+            feature_order = list(getattr(model, 'feature_names_in_', medians.keys()))
+
+        return model, le, medians, feature_order, None
+    except FileNotFoundError as e:
+        return None, None, None, None, f"Model files not found: {e}. Run train_model.py first."
+    except Exception as e:
+        return None, None, None, None, f"Failed to load model artifacts: {e}"
+
+model, le, medians, FEATURE_ORDER, load_error = load_artifacts()
 
 # --- Header Navigation ---
 st.markdown("# 🌍 SkyGuard AI")
@@ -248,7 +293,7 @@ with page[0]:
     st.markdown("### Enter environmental parameters for real-time AQI analysis")
     
     if model is None:
-        st.error("⚠️ Model files not found. Please run train_model.py first.")
+        st.error(f"⚠️ {load_error}")
     else:
         # Input Section
         st.markdown("---")
@@ -282,53 +327,45 @@ with page[0]:
         
         if predict_btn:
             with st.spinner("🔄 Analyzing environmental data..."):
-                # Prepare input with all 15 features
-                input_df = pd.DataFrame([[
-                    pm25, pm10, 
-                    medians['NO'], no2, medians['NOx'], 
-                    nh3, co, medians['SO2'], o3, 
-                    medians['Benzene'], medians['Toluene'],
-                    d.year, d.month, d.day, t.hour
-                ]], columns=['PM2.5', 'PM10', 'NO', 'NO2', 'NOx', 'NH3', 'CO', 'SO2', 'O3', 'Benzene', 'Toluene', 'Year', 'Month', 'Day', 'Hour'])
-                
-                # Get prediction
+                # Assemble the feature dict for this input. Fields not
+                # collected from the user fall back to training-set medians.
+                feature_values = {
+                    'PM2.5': pm25, 'PM10': pm10,
+                    'NO': medians.get('NO'), 'NO2': no2, 'NOx': medians.get('NOx'),
+                    'NH3': nh3, 'CO': co, 'SO2': medians.get('SO2'), 'O3': o3,
+                    'Benzene': medians.get('Benzene'), 'Toluene': medians.get('Toluene'),
+                    'Year': d.year, 'Month': d.month, 'Day': d.day, 'Hour': t.hour,
+                }
+                # Build the DataFrame in the EXACT column order the model was
+                # trained on (model.feature_names_in_), rather than a
+                # hand-typed list that could silently drift out of sync.
+                input_df = pd.DataFrame([[feature_values[col] for col in FEATURE_ORDER]], columns=FEATURE_ORDER)
+
+                # Get the model's actual prediction - this IS the ML output,
+                # and it now drives everything shown below.
                 res = model.predict(input_df)[0]
                 label = le.inverse_transform([res])[0]
-                
-                # Calculate numerical AQI based on PM2.5 (primary indicator)
-                # Using EPA AQI breakpoints for PM2.5
-                def calculate_aqi_pm25(pm25_value):
-                    breakpoints = [
-                        (0, 12.0, 0, 50),
-                        (12.1, 35.4, 51, 100),
-                        (35.5, 55.4, 101, 150),
-                        (55.5, 150.4, 151, 200),
-                        (150.5, 250.4, 201, 300),
-                        (250.5, 500.4, 301, 500)
-                    ]
-                    
-                    for bp_lo, bp_hi, aqi_lo, aqi_hi in breakpoints:
-                        if bp_lo <= pm25_value <= bp_hi:
-                            aqi = ((aqi_hi - aqi_lo) / (bp_hi - bp_lo)) * (pm25_value - bp_lo) + aqi_lo
-                            return round(aqi)
-                    return 500  # Maximum AQI
-                
-                numerical_aqi = calculate_aqi_pm25(pm25)
-                aqi_info = get_aqi_info(numerical_aqi)
-                
+                aqi_info = get_aqi_info(label)
+
+                # Indicative numeric sub-index from PM2.5 alone (CPCB scale).
+                # Shown as supporting context, NOT as if it were the model's
+                # output - it only looks at one of the model's 15 inputs.
+                pm25_index = pm25_subindex(pm25)
+
                 # Display Results
                 st.markdown("---")
                 st.markdown("## 🎯 Prediction Results")
-                
-                # AQI Value Card
+
+                # Category Card - driven by the model's predicted label
                 st.markdown(f"""
                 <div class="aqi-card" style="background: linear-gradient(135deg, {aqi_info['color']}88 0%, {aqi_info['color']}cc 100%);">
                     <div style="font-size: 3rem;">{aqi_info['icon']}</div>
-                    <div class="aqi-label">{aqi_info['category']}</div>
-                    <div class="aqi-value">{numerical_aqi}</div>
-                    <div style="font-size: 1.2rem; opacity: 0.9;">Air Quality Index</div>
+                    <div class="aqi-label">{label}</div>
+                    <div style="font-size: 1.2rem; opacity: 0.9;">Predicted AQI Category (Decision Tree model)</div>
                 </div>
                 """, unsafe_allow_html=True)
+
+                st.caption(f"📌 Indicative PM2.5 sub-index (single-pollutant estimate, CPCB scale): **{pm25_index}** — shown for context, not the model's prediction.")
                 
                 # Details in columns
                 col_a, col_b = st.columns(2)
@@ -626,7 +663,7 @@ with page[2]:
     
     ### 📈 Understanding AQI
     
-    The Air Quality Index (AQI) is divided into six categories:
+    This app predicts the **CPCB National AQI category** (the scale used for Indian station data), divided into six bands:
     """)
     
     col_info1, col_info2, col_info3 = st.columns(3)
@@ -634,28 +671,28 @@ with page[2]:
     with col_info1:
         st.markdown("""
         **😊 Good (0-50)**  
-        Air quality is satisfactory
-        
-        **😐 Moderate (51-100)**  
-        Acceptable for most people
+        Minimal impact
+
+        **🙂 Satisfactory (51-100)**  
+        Minor discomfort for sensitive people
         """)
     
     with col_info2:
         st.markdown("""
-        **😷 Unhealthy for Sensitive (101-150)**  
-        Sensitive groups affected
-        
-        **😨 Unhealthy (151-200)**  
-        Everyone may be affected
+        **😐 Moderate (101-200)**  
+        Discomfort for sensitive groups
+
+        **😷 Poor (201-300)**  
+        Discomfort on prolonged exposure
         """)
     
     with col_info3:
         st.markdown("""
-        **🤢 Very Unhealthy (201-300)**  
-        Health alert conditions
-        
-        **☠️ Hazardous (301+)**  
-        Emergency conditions
+        **😨 Very Poor (301-400)**  
+        Respiratory illness risk
+
+        **☠️ Severe (401-500)**  
+        Serious risk, affects healthy people too
         """)
     
     st.markdown("---")
